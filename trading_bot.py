@@ -14,17 +14,18 @@ warnings.filterwarnings('ignore')
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '5m'
 LEVERAGE = 30
-MODEL_FILE = 'fabio_relative_model.pkl'
-MEMORY_FILE = 'fabio_memory.csv'
+MODEL_FILE = 'regime_model_v1.pkl'
+MEMORY_FILE = 'market_memory.csv'
 
-# TELEGRAM KEYS (PASTE YOURS HERE)
+# TELEGRAM
+
 TELEGRAM_TOKEN = "8246165743:AAFHcF8NpJmmDsLAZjRoTm4nZaa3MUT4Z5M" 
 TELEGRAM_CHAT_ID = "5291207565"
 
-# 🎯 RISK MANAGEMENT (THE FABIO SETTINGS)
-ATR_SL_MULTIPLIER = 1.5   # Stop Loss = 1.5x Volatility (Tight)
-RISK_REWARD = 2.5         # Target = 2.5x Risk (Big Wins)
-CONFIDENCE_THRESHOLD = 55.0
+# ADVANCED RISK SETTINGS
+ATR_SL_MULTIPLIER = 1.5 
+RISK_REWARD = 2.0
+CONFIDENCE_THRESHOLD = 50.0 
 
 # ==========================================
 # 🔧 SETUP
@@ -35,9 +36,9 @@ exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'fu
 print(f"🧠 Loading {MODEL_FILE}...")
 try:
     model = joblib.load(MODEL_FILE)
-    print("✅ Model Loaded!")
+    print("✅ Regime Model Loaded!")
 except:
-    print(f"❌ Error: {MODEL_FILE} not found! Upload it first.")
+    print(f"❌ Error: {MODEL_FILE} not found!")
     exit()
 
 def send_telegram(msg):
@@ -53,7 +54,7 @@ def send_telegram(msg):
 # ==========================================
 def update_memory():
     if not os.path.exists(MEMORY_FILE):
-        print("📥 Initializing Memory (Downloading 1000 candles)...")
+        print("📥 Downloading 1000 candles history...")
         bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=1000)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df.to_csv(MEMORY_FILE, index=False)
@@ -61,7 +62,6 @@ def update_memory():
     
     df_old = pd.read_csv(MEMORY_FILE)
     last_time = df_old['timestamp'].iloc[-1]
-    
     new_bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
     df_new = pd.DataFrame(new_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df_new = df_new[df_new['timestamp'] > last_time]
@@ -73,59 +73,63 @@ def update_memory():
     return df_old
 
 # ==========================================
-# 🧮 FEATURE ENGINEERING
+# 🧮 ADVANCED FEATURE ENGINEERING
 # ==========================================
 def prepare_features(df):
     if len(df) < 300: return None, None, None
 
-    # 1. Indicators
-    window = 288
-    df['Typical'] = (df['high'] + df['low'] + df['close']) / 3
-    df['Vol_Price'] = df['Typical'] * df['volume']
+    # 1. ADX (Trend Strength)
+    period = 14
+    df['tr0'] = abs(df['high'] - df['low'])
+    df['tr1'] = abs(df['high'] - df['close'].shift(1))
+    df['tr2'] = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+    df['atr'] = df['tr'].rolling(period).mean()
     
-    df['VWAP'] = df['Vol_Price'].rolling(window).sum() / df['volume'].rolling(window).sum()
-    df['VWAP_Std'] = df['close'].rolling(window).std()
+    df['up_move'] = df['high'] - df['high'].shift(1)
+    df['down_move'] = df['low'].shift(1) - df['low']
     
-    df['VAH'] = df['VWAP'] + (2.0 * df['VWAP_Std'])
-    df['VAL'] = df['VWAP'] - (2.0 * df['VWAP_Std'])
+    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)
+    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)
+    
+    df['plus_di'] = 100 * (df['plus_dm'].rolling(period).mean() / df['atr'])
+    df['minus_di'] = 100 * (df['minus_dm'].rolling(period).mean() / df['atr'])
+    df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+    df['adx'] = df['dx'].rolling(period).mean()
 
-    # 2. Relative Distance
-    df['Pct_Above_VAL'] = (df['close'] - df['VAL']) / df['VAL'] * 100
-    df['Pct_Below_VAH'] = (df['VAH'] - df['close']) / df['VAH'] * 100
-    df['Dist_VWAP'] = (df['close'] - df['VWAP']) / df['VWAP'] * 100
+    # 2. EMA Trend
+    df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
+    df['Trend_Score'] = np.where((df['close'] > df['ema_50']) & (df['ema_50'] > df['ema_200']), 1, 
+                        np.where((df['close'] < df['ema_50']) & (df['ema_50'] < df['ema_200']), -1, 0))
 
-    # 3. Absorption/Momentum
-    df['Avg_Vol'] = df['volume'].rolling(20).mean()
-    df['Vol_Ratio'] = df['volume'] / df['Avg_Vol']
-    df['Body'] = abs(df['close'] - df['open'])
-    df['Avg_Body'] = df['Body'].rolling(20).mean()
-    
-    df['Absorption'] = np.where((df['Vol_Ratio'] > 2.0) & (df['Body'] < df['Avg_Body'] * 0.5), 1, 0)
-    df['Momentum'] = np.where((df['Vol_Ratio'] > 2.0) & (df['Body'] > df['Avg_Body'] * 1.5), 1, 0)
+    # 3. RSI
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
 
-    # 4. ATR (For Stop Loss)
-    df['tr'] = np.maximum(df['high'] - df['low'], abs(df['high'] - df['close'].shift()))
-    df['ATR'] = df['tr'].rolling(14).mean()
+    # 4. Volatility Squeeze
+    df['std'] = df['close'].rolling(20).std()
+    df['bb_width'] = (4 * df['std']) / df['close']
+    df['vol_squeeze'] = np.where(df['bb_width'] < df['bb_width'].rolling(50).min() * 1.2, 1, 0)
 
-    last = df.iloc[-1]
-    
-    input_data = {
-        'Pct_Above_VAL': [last['Pct_Above_VAL']],
-        'Pct_Below_VAH': [last['Pct_Below_VAH']],
-        'Dist_VWAP': [last['Dist_VWAP']],
-        'Vol_Ratio': [last['Vol_Ratio']],
-        'Absorption': [last['Absorption']],
-        'Momentum': [last['Momentum']]
-    }
-    
-    return pd.DataFrame(input_data), last, last['ATR']
+    # 5. ATR for Risk
+    df['ATR_Risk'] = df['tr'].rolling(14).mean()
+
+    # Clean & Select
+    df_clean = df.dropna().tail(1)
+    if df_clean.empty: return None, None, None
+
+    features = ['adx', 'plus_di', 'minus_di', 'Trend_Score', 'RSI', 'vol_squeeze', 'volume']
+    return df_clean[features], df_clean.iloc[0], df_clean['ATR_Risk'].iloc[0]
 
 # ==========================================
 # 🚀 MAIN LOOP
 # ==========================================
-print(f"🚀 FABIO BOT STARTED: {SYMBOL}")
-print("Mode: Calculating Live Risk (SL/TP)")
-send_telegram(f"✅ **Fabio Bot Online**\nRisk Settings: SL={ATR_SL_MULTIPLIER}x ATR, TP={RISK_REWARD}R")
+print(f"🚀 HEDGE FUND BOT STARTED: {SYMBOL}")
+send_telegram(f"✅ **Advanced Bot Online**\nMode: Regime Filtering (Trend/Range)")
 
 while True:
     try:
@@ -133,81 +137,85 @@ while True:
         features, candle, atr = prepare_features(df)
         
         if features is not None:
-            # Predict
             pred = model.predict(features)[0]
             prob = model.predict_proba(features)[0]
             confidence = prob.max() * 100
             
-            # Live Data
+            # Market State
             price = candle['close']
-            val = candle['VAL']
-            vah = candle['VAH']
-            vwap = candle['VWAP']
+            rsi = candle['RSI']
+            adx = candle['adx']
+            trend_score = candle['Trend_Score']
             
-            # --- 🧮 CALCULATE POTENTIAL SL/TP ---
-            # Buying Math:
-            buy_sl = price - (atr * ATR_SL_MULTIPLIER)
-            buy_risk = price - buy_sl
-            buy_tp = price + (buy_risk * RISK_REWARD)
+            # DETERMINE REGIME
+            regime = "RANGE"
+            if adx > 25: regime = "TRENDING"
             
-            # Selling Math:
-            sell_sl = price + (atr * ATR_SL_MULTIPLIER)
-            sell_risk = sell_sl - price
-            sell_tp = price - (sell_risk * RISK_REWARD)
+            # --- TRADING LOGIC ---
+            
+            # 🟢 BUY LOGIC
+            if pred == 1: 
+                trade_valid = False
+                reason = ""
+                
+                # Case A: Strong Uptrend (Buy the strength)
+                if regime == "TRENDING" and trend_score == 1:
+                    trade_valid = True
+                    reason = "Trend Follow (Strong ADX)"
+                
+                # Case B: Range Reversal (Buy the dip)
+                elif regime == "RANGE" and rsi < 40:
+                    trade_valid = True
+                    reason = "Range Reversal (Oversold)"
+                
+                # Execution
+                if trade_valid and confidence > CONFIDENCE_THRESHOLD:
+                    sl = price - (atr * ATR_SL_MULTIPLIER)
+                    tp = price + ((price - sl) * RISK_REWARD)
+                    risk_amt = price - sl
+                    
+                    msg = (f"🟢 **BUY SIGNAL**\nRegime: {regime}\nReason: {reason}\n"
+                           f"Price: {price:.2f}\nConf: {confidence:.1f}%\n"
+                           f"SL: {sl:.2f} | TP: {tp:.2f}")
+                    print(">>> 🔥 BUY SIGNAL SENT")
+                    send_telegram(msg)
+                    time.sleep(300)
+                else:
+                    print(f"⚠️ Buy Ignored: Regime={regime}, Trend={trend_score}, RSI={rsi:.1f}")
 
-            # --- SIGNAL LOGIC ---
-            
-            # 1. BUY SIGNAL (Reversion or Momentum)
-            if pred == 1:
-                # Filter: Must be cheap OR Momentum Breakout
-                if (price < val * 1.005) or (candle['Momentum'] == 1 and price > vwap):
-                    if confidence > CONFIDENCE_THRESHOLD:
-                        msg = (
-                            f"🟢 **BUY SIGNAL**\n"
-                            f"Price: {price:.2f}\n"
-                            f"Conf: {confidence:.1f}%\n"
-                            f"----------------\n"
-                            f"🛑 STOP LOSS: {buy_sl:.2f}\n"
-                            f"🎯 TAKE PROFIT: {buy_tp:.2f}\n"
-                            f"Risk: ${buy_risk:.2f} per unit"
-                        )
-                        print("\n>>> 🟢 BUY SIGNAL SENT")
-                        send_telegram(msg)
-                        time.sleep(300)
-            
-            # 2. SELL SIGNAL
+            # 🔴 SELL LOGIC
             elif pred == 2:
-                # Filter: Must be expensive OR Momentum Breakdown
-                if (price > vah * 0.995) or (candle['Momentum'] == 1 and price < vwap):
-                    if confidence > CONFIDENCE_THRESHOLD:
-                        msg = (
-                            f"🔴 **SELL SIGNAL**\n"
-                            f"Price: {price:.2f}\n"
-                            f"Conf: {confidence:.1f}%\n"
-                            f"----------------\n"
-                            f"🛑 STOP LOSS: {sell_sl:.2f}\n"
-                            f"🎯 TAKE PROFIT: {sell_tp:.2f}\n"
-                            f"Risk: ${sell_risk:.2f} per unit"
-                        )
-                        print("\n>>> 🔴 SELL SIGNAL SENT")
-                        send_telegram(msg)
-                        time.sleep(300)
-
-            # --- DISPLAY DASHBOARD (Every 30s) ---
-            print("-" * 50)
-            print(f"TIME: {time.strftime('%H:%M:%S')} | PRICE: {price:.2f}")
-            print(f"AI: {pred} ({confidence:.0f}%) | ATR: {atr:.2f}")
-            print(f"LEVELS: VAL {val:.2f} | VAH {vah:.2f}")
+                trade_valid = False
+                reason = ""
+                
+                # Case A: Strong Downtrend (Sell the strength)
+                if regime == "TRENDING" and trend_score == -1:
+                    trade_valid = True
+                    reason = "Trend Follow (Strong ADX)"
+                
+                # Case B: Range Reversal (Sell the top)
+                elif regime == "RANGE" and rsi > 60:
+                    trade_valid = True
+                    reason = "Range Reversal (Overbought)"
+                
+                # Execution
+                if trade_valid and confidence > CONFIDENCE_THRESHOLD:
+                    sl = price + (atr * ATR_SL_MULTIPLIER)
+                    tp = price - ((sl - price) * RISK_REWARD)
+                    
+                    msg = (f"🔴 **SELL SIGNAL**\nRegime: {regime}\nReason: {reason}\n"
+                           f"Price: {price:.2f}\nConf: {confidence:.1f}%\n"
+                           f"SL: {sl:.2f} | TP: {tp:.2f}")
+                    print(">>> 🔥 SELL SIGNAL SENT")
+                    send_telegram(msg)
+                    time.sleep(300)
+                else:
+                    print(f"⚠️ Sell Ignored: Regime={regime}, Trend={trend_score}, RSI={rsi:.1f}")
             
-            # Show Potential Targets so you can see the math working
-            if pred == 1:
-                print(f"👀 WATCHING BUY: SL {buy_sl:.2f} | TP {buy_tp:.2f}")
-            elif pred == 2:
-                print(f"👀 WATCHING SELL: SL {sell_sl:.2f} | TP {sell_tp:.2f}")
             else:
-                print(f"💤 WAITING (Neutral)")
-            
-        time.sleep(30)
+                print(f"Price: {price:.2f} | Regime: {regime} (ADX {adx:.1f}) | AI: {pred} ({confidence:.0f}%)")
+
+        time.sleep(15)
 
     except KeyboardInterrupt:
         break
