@@ -3,8 +3,7 @@ import pandas as pd
 import numpy as np
 import joblib
 import time
-import os
-import requests
+import requests  # <--- NEW: For Telegram
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -12,213 +11,202 @@ warnings.filterwarnings('ignore')
 # ⚙️ CONFIGURATION
 # ==========================================
 SYMBOL = 'ETH/USDT'
-TIMEFRAME = '5m'
+TIMEFRAME = '15m'
 LEVERAGE = 30
-MODEL_FILE = 'regime_model_v1.pkl'
-MEMORY_FILE = 'market_memory.csv'
+MODEL_FILE = 'smc_perfect_model.pkl'
 
-# TELEGRAM
+# --- TELEGRAM KEYS (PASTE YOURS HERE) ---
+# Keep the quotes "" around the numbers/text
+
 
 TELEGRAM_TOKEN = "8246165743:AAFHcF8NpJmmDsLAZjRoTm4nZaa3MUT4Z5M" 
 TELEGRAM_CHAT_ID = "5291207565"
 
-# ADVANCED RISK SETTINGS
-ATR_SL_MULTIPLIER = 1.5 
-RISK_REWARD = 2.0
-CONFIDENCE_THRESHOLD = 50.0 
+
+# RISK SETTINGS
+ATR_SL_MULTIPLIER = 2.0  # Stop Loss width
+RISK_REWARD = 2.0        # Target Profit multiplier
+CONFIDENCE_THRESHOLD = 60.0 # Only trade if AI is >60% sure
 
 # ==========================================
 # 🔧 SETUP
 # ==========================================
-print("🔌 Connecting to Binance...")
-exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+print("🔌 Connecting to Binance Futures...")
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'}
+})
 
-print(f"🧠 Loading {MODEL_FILE}...")
+print("🧠 Loading SMC Perfect Model...")
 try:
     model = joblib.load(MODEL_FILE)
-    print("✅ Regime Model Loaded!")
-except:
-    print(f"❌ Error: {MODEL_FILE} not found!")
+    print("✅ Model Loaded!")
+except Exception as e:
+    print(f"❌ Error: Could not find {MODEL_FILE}")
     exit()
 
-def send_telegram(msg):
+# ==========================================
+# 📱 TELEGRAM FUNCTION
+# ==========================================
+def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-        requests.post(url, data=data, timeout=5)
-    except:
-        pass
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID, 
+            "text": message,
+            "parse_mode": "Markdown" # Makes bold text look nice
+        }
+        requests.post(url, data=data)
+        print("✅ Telegram Sent!")
+    except Exception as e:
+        print(f"❌ Telegram Error: {e}")
+
+# Test the connection immediately on startup
+print("📞 Testing Telegram Connection...")
+send_telegram(f"✅ **BOT STARTED**\nSymbol: {SYMBOL}\nStrategy: SMC Perfect Model")
 
 # ==========================================
-# 💾 MEMORY SYSTEM
+# 🧮 MATH FUNCTIONS
 # ==========================================
-def update_memory():
-    if not os.path.exists(MEMORY_FILE):
-        print("📥 Downloading 1000 candles history...")
-        bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=1000)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df.to_csv(MEMORY_FILE, index=False)
-        return df
-    
-    df_old = pd.read_csv(MEMORY_FILE)
-    last_time = df_old['timestamp'].iloc[-1]
-    new_bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
-    df_new = pd.DataFrame(new_bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df_new = df_new[df_new['timestamp'] > last_time]
-    
-    if not df_new.empty:
-        df_updated = pd.concat([df_old, df_new], ignore_index=True).tail(2000)
-        df_updated.to_csv(MEMORY_FILE, index=False)
-        return df_updated
-    return df_old
+def get_atr(df, period=14):
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    return ranges.max(axis=1).rolling(window=period).mean()
 
 # ==========================================
-# 🧮 ADVANCED FEATURE ENGINEERING
+# 📊 FEATURE ENGINEERING (Matches Training)
 # ==========================================
-def prepare_features(df):
-    if len(df) < 300: return None, None, None
+def prepare_smc_features(df):
+    # Ensure we have enough data
+    if len(df) < 25: return None, None, None
 
-    # 1. ADX (Trend Strength)
-    period = 14
-    df['tr0'] = abs(df['high'] - df['low'])
-    df['tr1'] = abs(df['high'] - df['close'].shift(1))
-    df['tr2'] = abs(df['low'] - df['close'].shift(1))
-    df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
-    df['atr'] = df['tr'].rolling(period).mean()
+    # Calculate ATR for Risk Management
+    df['ATR'] = get_atr(df, 14)
+    current_atr = df['ATR'].iloc[-1]
     
-    df['up_move'] = df['high'] - df['high'].shift(1)
-    df['down_move'] = df['low'].shift(1) - df['low']
+    # Flatten Data (Last 20 candles for the model)
+    last_20 = df.tail(20).reset_index(drop=True)
     
-    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0)
-    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0)
+    # 1. Create the base row
+    input_data = {}
+    for i in range(20):
+        row = last_20.iloc[i]
+        s = str(i + 1)
+        input_data[f'open{s}'] = row['open']
+        input_data[f'high{s}'] = row['high']
+        input_data[f'low{s}'] = row['low']
+        input_data[f'close{s}'] = row['close']
+        input_data[f'volume{s}'] = row['volume']
     
-    df['plus_di'] = 100 * (df['plus_dm'].rolling(period).mean() / df['atr'])
-    df['minus_di'] = 100 * (df['minus_dm'].rolling(period).mean() / df['atr'])
-    df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
-    df['adx'] = df['dx'].rolling(period).mean()
+    row_df = pd.DataFrame([input_data])
 
-    # 2. EMA Trend
-    df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
-    df['Trend_Score'] = np.where((df['close'] > df['ema_50']) & (df['ema_50'] > df['ema_200']), 1, 
-                        np.where((df['close'] < df['ema_50']) & (df['ema_50'] < df['ema_200']), -1, 0))
+    # 2. CALCULATE SMC FEATURES (The "Perfect" Logic)
+    
+    # FVG Detection
+    row_df['Has_Bullish_FVG'] = np.where(
+        (row_df['low20'] > row_df['high18']) & (row_df['close19'] > row_df['open19']), 1, 0
+    )
+    row_df['Has_Bearish_FVG'] = np.where(
+        (row_df['high20'] < row_df['low18']) & (row_df['close19'] < row_df['open19']), 1, 0
+    )
 
-    # 3. RSI
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    # BOS (Break of Structure) Logic
+    high_cols = [f'high{i}' for i in range(1, 20)]
+    low_cols = [f'low{i}' for i in range(1, 20)]
+    
+    prev_high_max = row_df[high_cols].max(axis=1)
+    prev_low_min = row_df[low_cols].min(axis=1)
+    
+    row_df['BOS_Bullish'] = np.where(row_df['close20'] > prev_high_max, 1, 0)
+    row_df['BOS_Bearish'] = np.where(row_df['close20'] < prev_low_min, 1, 0)
 
-    # 4. Volatility Squeeze
-    df['std'] = df['close'].rolling(20).std()
-    df['bb_width'] = (4 * df['std']) / df['close']
-    df['vol_squeeze'] = np.where(df['bb_width'] < df['bb_width'].rolling(50).min() * 1.2, 1, 0)
-
-    # 5. ATR for Risk
-    df['ATR_Risk'] = df['tr'].rolling(14).mean()
-
-    # Clean & Select
-    df_clean = df.dropna().tail(1)
-    if df_clean.empty: return None, None, None
-
-    features = ['adx', 'plus_di', 'minus_di', 'Trend_Score', 'RSI', 'vol_squeeze', 'volume']
-    return df_clean[features], df_clean.iloc[0], df_clean['ATR_Risk'].iloc[0]
+    # 3. Filter Columns (Keep ONLY what the model was trained on)
+    feature_cols = ['Has_Bullish_FVG', 'Has_Bearish_FVG', 'BOS_Bullish', 'BOS_Bearish',
+                    'open16','close16','open17','close17','open18','close18','open19','close19','open20','close20',
+                    'volume20']
+    
+    try:
+        final_features = row_df[feature_cols]
+        return final_features, last_20.iloc[-1], current_atr
+    except KeyError as e:
+        print(f"Column Error: {e}")
+        return None, None, None
 
 # ==========================================
 # 🚀 MAIN LOOP
 # ==========================================
-print(f"🚀 HEDGE FUND BOT STARTED: {SYMBOL}")
-send_telegram(f"✅ **Advanced Bot Online**\nMode: Regime Filtering (Trend/Range)")
+print(f"🚀 SMC-PERFECT BOT STARTED: {SYMBOL}")
+print("Waiting for signals...")
 
 while True:
     try:
-        df = update_memory()
-        features, candle, atr = prepare_features(df)
+        # Get Live Data
+        bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
+        df_full = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        # Prepare Features
+        features, candle, atr = prepare_smc_features(df_full)
         
         if features is not None:
-            pred = model.predict(features)[0]
-            prob = model.predict_proba(features)[0]
-            confidence = prob.max() * 100
+            # Predict
+            prediction = model.predict(features)[0]      # 0, 1, or 2
+            probabilities = model.predict_proba(features)[0]
+            confidence = probabilities.max() * 100
             
-            # Market State
             price = candle['close']
-            rsi = candle['RSI']
-            adx = candle['adx']
-            trend_score = candle['Trend_Score']
             
-            # DETERMINE REGIME
-            regime = "RANGE"
-            if adx > 25: regime = "TRENDING"
-            
-            # --- TRADING LOGIC ---
-            
-            # 🟢 BUY LOGIC
-            if pred == 1: 
-                trade_valid = False
-                reason = ""
-                
-                # Case A: Strong Uptrend (Buy the strength)
-                if regime == "TRENDING" and trend_score == 1:
-                    trade_valid = True
-                    reason = "Trend Follow (Strong ADX)"
-                
-                # Case B: Range Reversal (Buy the dip)
-                elif regime == "RANGE" and rsi < 40:
-                    trade_valid = True
-                    reason = "Range Reversal (Oversold)"
-                
-                # Execution
-                if trade_valid and confidence > CONFIDENCE_THRESHOLD:
-                    sl = price - (atr * ATR_SL_MULTIPLIER)
-                    tp = price + ((price - sl) * RISK_REWARD)
-                    risk_amt = price - sl
-                    
-                    msg = (f"🟢 **BUY SIGNAL**\nRegime: {regime}\nReason: {reason}\n"
-                           f"Price: {price:.2f}\nConf: {confidence:.1f}%\n"
-                           f"SL: {sl:.2f} | TP: {tp:.2f}")
-                    print(">>> 🔥 BUY SIGNAL SENT")
-                    send_telegram(msg)
-                    time.sleep(300)
-                else:
-                    print(f"⚠️ Buy Ignored: Regime={regime}, Trend={trend_score}, RSI={rsi:.1f}")
+            # Print Status
+            status = "HOLD"
+            if prediction == 1: status = "BUY"
+            if prediction == 2: status = "SELL"
+            print(f"Price: {price:.2f} | Signal: {status} | Conf: {confidence:.1f}%")
 
-            # 🔴 SELL LOGIC
-            elif pred == 2:
-                trade_valid = False
-                reason = ""
+            # --- BUY SIGNAL ---
+            if prediction == 1 and confidence >= CONFIDENCE_THRESHOLD:
+                sl = price - (atr * ATR_SL_MULTIPLIER)
+                risk = price - sl
+                tp = price + (risk * RISK_REWARD)
                 
-                # Case A: Strong Downtrend (Sell the strength)
-                if regime == "TRENDING" and trend_score == -1:
-                    trade_valid = True
-                    reason = "Trend Follow (Strong ADX)"
-                
-                # Case B: Range Reversal (Sell the top)
-                elif regime == "RANGE" and rsi > 60:
-                    trade_valid = True
-                    reason = "Range Reversal (Overbought)"
-                
-                # Execution
-                if trade_valid and confidence > CONFIDENCE_THRESHOLD:
-                    sl = price + (atr * ATR_SL_MULTIPLIER)
-                    tp = price - ((sl - price) * RISK_REWARD)
-                    
-                    msg = (f"🔴 **SELL SIGNAL**\nRegime: {regime}\nReason: {reason}\n"
-                           f"Price: {price:.2f}\nConf: {confidence:.1f}%\n"
-                           f"SL: {sl:.2f} | TP: {tp:.2f}")
-                    print(">>> 🔥 SELL SIGNAL SENT")
-                    send_telegram(msg)
-                    time.sleep(300)
-                else:
-                    print(f"⚠️ Sell Ignored: Regime={regime}, Trend={trend_score}, RSI={rsi:.1f}")
-            
-            else:
-                print(f"Price: {price:.2f} | Regime: {regime} (ADX {adx:.1f}) | AI: {pred} ({confidence:.0f}%)")
+                msg = (
+                    f"🚀 **BUY SIGNAL**\n"
+                    f"Pair: {SYMBOL}\n"
+                    f"Confidence: {confidence:.1f}%\n"
+                    f"----------------\n"
+                    f"ENTRY: ${price:.2f}\n"
+                    f"STOP LOSS: ${sl:.2f}\n"
+                    f"TAKE PROFIT: ${tp:.2f}\n"
+                    f"Risk: {RISK_REWARD}R"
+                )
+                print(">>> 🟢 SENDING BUY ALERT")
+                send_telegram(msg)
+                time.sleep(300) # Wait 5 mins
 
-        time.sleep(15)
+            # --- SELL SIGNAL ---
+            elif prediction == 2 and confidence >= CONFIDENCE_THRESHOLD:
+                sl = price + (atr * ATR_SL_MULTIPLIER) # SL above for short
+                risk = sl - price
+                tp = price - (risk * RISK_REWARD)      # TP below for short
+                
+                msg = (
+                    f"🔻 **SELL SIGNAL**\n"
+                    f"Pair: {SYMBOL}\n"
+                    f"Confidence: {confidence:.1f}%\n"
+                    f"----------------\n"
+                    f"ENTRY: ${price:.2f}\n"
+                    f"STOP LOSS: ${sl:.2f}\n"
+                    f"TAKE PROFIT: ${tp:.2f}\n"
+                    f"Risk: {RISK_REWARD}R"
+                )
+                print(">>> 🔴 SENDING SELL ALERT")
+                send_telegram(msg)
+                time.sleep(300)
 
+        time.sleep(15) # Check every 15 seconds
+        
     except KeyboardInterrupt:
         break
     except Exception as e:
         print(f"Loop Error: {e}")
-        time.sleep(10)
+        time.sleep(5)
