@@ -3,30 +3,29 @@ import pandas as pd
 import numpy as np
 import joblib
 import time
-import requests  # <--- NEW: For Telegram
+import requests
 import warnings
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# ⚙️ CONFIGURATION
+# ⚙️ CONFIGURATION & KEYS
 # ==========================================
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '15m'
-LEVERAGE = 30
 MODEL_FILE = 'smc_perfect_model.pkl'
-
-# --- TELEGRAM KEYS (PASTE YOURS HERE) ---
-# Keep the quotes "" around the numbers/text
 
 
 TELEGRAM_TOKEN = "8246165743:AAFHcF8NpJmmDsLAZjRoTm4nZaa3MUT4Z5M" 
 TELEGRAM_CHAT_ID = "5291207565"
 
 
-# RISK SETTINGS
-ATR_SL_MULTIPLIER = 2.0  # Stop Loss width
-RISK_REWARD = 2.0        # Target Profit multiplier
-CONFIDENCE_THRESHOLD = 60.0 # Only trade if AI is >60% sure
+# --- 🧠 SMC RISK MANAGEMENT SETTINGS ---
+# Instead of fixed numbers, we use Structure Lookback
+SWING_LOOKBACK = 10       # Look back 10 candles to find Swing High/Low for SL
+SL_BUFFER_ATR = 0.5       # Add 0.5x ATR buffer to SL so wicks don't stop us out
+TARGET_RISK_REWARD = 2.5  # We want 1:2.5 Risk to Reward (SMC usually aims high)
+MAX_SL_PERCENT = 0.015    # (1.5%) If structural SL is wider than this, SKIP trade (Too risky)
+CONFIDENCE_THRESHOLD = 65.0 # Increased confidence requirement
 
 # ==========================================
 # 🔧 SETUP
@@ -37,36 +36,24 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'future'}
 })
 
-print("🧠 Loading SMC Perfect Model...")
+print(f"🧠 Loading {MODEL_FILE}...")
 try:
     model = joblib.load(MODEL_FILE)
-    print("✅ Model Loaded!")
+    print("✅ Model Loaded Successfully!")
 except Exception as e:
-    print(f"❌ Error: Could not find {MODEL_FILE}")
+    print(f"❌ Error: Could not find {MODEL_FILE}. Make sure to upload it!")
     exit()
 
-# ==========================================
-# 📱 TELEGRAM FUNCTION
-# ==========================================
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID, 
-            "text": message,
-            "parse_mode": "Markdown" # Makes bold text look nice
-        }
-        requests.post(url, data=data)
-        print("✅ Telegram Sent!")
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, data=data, timeout=10)
     except Exception as e:
         print(f"❌ Telegram Error: {e}")
 
-# Test the connection immediately on startup
-print("📞 Testing Telegram Connection...")
-send_telegram(f"✅ **BOT STARTED**\nSymbol: {SYMBOL}\nStrategy: SMC Perfect Model")
-
 # ==========================================
-# 🧮 MATH FUNCTIONS
+# 🧮 ADVANCED CALCULATIONS
 # ==========================================
 def get_atr(df, period=14):
     high_low = df['high'] - df['low']
@@ -75,21 +62,16 @@ def get_atr(df, period=14):
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     return ranges.max(axis=1).rolling(window=period).mean()
 
-# ==========================================
-# 📊 FEATURE ENGINEERING (Matches Training)
-# ==========================================
-def prepare_smc_features(df):
-    # Ensure we have enough data
-    if len(df) < 25: return None, None, None
-
-    # Calculate ATR for Risk Management
+def prepare_features(df):
+    if len(df) < 30: return None, None, None
+    
+    # 1. Engineering Features
     df['ATR'] = get_atr(df, 14)
     current_atr = df['ATR'].iloc[-1]
     
-    # Flatten Data (Last 20 candles for the model)
     last_20 = df.tail(20).reset_index(drop=True)
     
-    # 1. Create the base row
+    # Flatten last 20 candles into one row
     input_data = {}
     for i in range(20):
         row = last_20.iloc[i]
@@ -99,113 +81,150 @@ def prepare_smc_features(df):
         input_data[f'low{s}'] = row['low']
         input_data[f'close{s}'] = row['close']
         input_data[f'volume{s}'] = row['volume']
-    
+        
     row_df = pd.DataFrame([input_data])
 
-    # 2. CALCULATE SMC FEATURES (The "Perfect" Logic)
-    
-    # FVG Detection
+    # SMC Logic Recreation
+    # FVG
     row_df['Has_Bullish_FVG'] = np.where(
         (row_df['low20'] > row_df['high18']) & (row_df['close19'] > row_df['open19']), 1, 0
     )
     row_df['Has_Bearish_FVG'] = np.where(
         (row_df['high20'] < row_df['low18']) & (row_df['close19'] < row_df['open19']), 1, 0
     )
-
-    # BOS (Break of Structure) Logic
+    # BOS
     high_cols = [f'high{i}' for i in range(1, 20)]
     low_cols = [f'low{i}' for i in range(1, 20)]
-    
-    prev_high_max = row_df[high_cols].max(axis=1)
-    prev_low_min = row_df[low_cols].min(axis=1)
-    
-    row_df['BOS_Bullish'] = np.where(row_df['close20'] > prev_high_max, 1, 0)
-    row_df['BOS_Bearish'] = np.where(row_df['close20'] < prev_low_min, 1, 0)
+    row_df['BOS_Bullish'] = np.where(row_df['close20'] > row_df[high_cols].max(axis=1), 1, 0)
+    row_df['BOS_Bearish'] = np.where(row_df['close20'] < row_df[low_cols].min(axis=1), 1, 0)
 
-    # 3. Filter Columns (Keep ONLY what the model was trained on)
+    # Select Columns
     feature_cols = ['Has_Bullish_FVG', 'Has_Bearish_FVG', 'BOS_Bullish', 'BOS_Bearish',
                     'open16','close16','open17','close17','open18','close18','open19','close19','open20','close20',
                     'volume20']
     
-    try:
-        final_features = row_df[feature_cols]
-        return final_features, last_20.iloc[-1], current_atr
-    except KeyError as e:
-        print(f"Column Error: {e}")
-        return None, None, None
+    return row_df[feature_cols], df, current_atr
+
+# ==========================================
+# 💎 SMART MONEY LEVEL CALCULATOR
+# ==========================================
+def calculate_smart_levels(direction, current_price, df_full, atr):
+    """
+    Calculates Stop Loss based on recent Swing High/Low (Structure)
+    Calculates Take Profit based on Risk:Reward ratio.
+    """
+    # Look at the last N candles for structure
+    recent_data = df_full.tail(SWING_LOOKBACK + 1) # +1 to include current
+    
+    if direction == "BUY":
+        # SL is below the lowest low of recent structure - Buffer
+        lowest_low = recent_data['low'].min()
+        stop_loss = lowest_low - (atr * SL_BUFFER_ATR)
+        
+        # Risk Calculation
+        risk_per_share = current_price - stop_loss
+        
+        # Take Profit (Risk * Reward Ratio)
+        take_profit = current_price + (risk_per_share * TARGET_RISK_REWARD)
+        
+    elif direction == "SELL":
+        # SL is above the highest high of recent structure + Buffer
+        highest_high = recent_data['high'].max()
+        stop_loss = highest_high + (atr * SL_BUFFER_ATR)
+        
+        # Risk Calculation
+        risk_per_share = stop_loss - current_price
+        
+        # Take Profit
+        take_profit = current_price - (risk_per_share * TARGET_RISK_REWARD)
+        
+    return stop_loss, take_profit
 
 # ==========================================
 # 🚀 MAIN LOOP
 # ==========================================
-print(f"🚀 SMC-PERFECT BOT STARTED: {SYMBOL}")
-print("Waiting for signals...")
+print(f"🚀 SMC-PERFECT BOT V2 STARTED: {SYMBOL}")
+print(f"Strategy: Structure Based SL | {TARGET_RISK_REWARD}R Targets")
+send_telegram(f"✅ **BOT RESTARTED**\nTargeting {TARGET_RISK_REWARD}R Trades on {SYMBOL}")
 
 while True:
     try:
-        # Get Live Data
+        # 1. Fetch Data
         bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
         df_full = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # Prepare Features
-        features, candle, atr = prepare_smc_features(df_full)
+        # 2. Get AI Prediction
+        features, data_history, atr = prepare_features(df_full)
         
         if features is not None:
-            # Predict
-            prediction = model.predict(features)[0]      # 0, 1, or 2
-            probabilities = model.predict_proba(features)[0]
-            confidence = probabilities.max() * 100
+            prediction = model.predict(features)[0]
+            probs = model.predict_proba(features)[0]
+            confidence = probs.max() * 100
             
-            price = candle['close']
+            current_price = df_full['close'].iloc[-1]
+
+            # 3. Decision Logic
+            if confidence >= CONFIDENCE_THRESHOLD:
+                
+                # --- BUY LOGIC ---
+                if prediction == 1:
+                    sl, tp = calculate_smart_levels("BUY", current_price, df_full, atr)
+                    risk_pct = (current_price - sl) / current_price
+                    
+                    # Safety Check: Is SL too far? (Don't enter if risk is huge)
+                    if risk_pct > MAX_SL_PERCENT:
+                        print(f"⚠️ Signal Ignored: Stop Loss too wide ({risk_pct*100:.2f}%)")
+                    elif sl >= current_price:
+                        print(f"⚠️ Signal Ignored: SL Calculation Error (Price close to low)")
+                    else:
+                        msg = (
+                            f"🟢 **LONG ENTRY (SMC)**\n"
+                            f"Pair: `{SYMBOL}`\n"
+                            f"Price: `${current_price:.2f}`\n"
+                            f"---------------------\n"
+                            f"🛑 **SL: `${sl:.2f}`** (Below Structure)\n"
+                            f"🎯 **TP: `${tp:.2f}`** ({TARGET_RISK_REWARD}R)\n"
+                            f"---------------------\n"
+                            f"🤖 AI Conf: {confidence:.1f}%\n"
+                            f"Risk: {risk_pct*100:.2f}%"
+                        )
+                        print(">>> SENDING BUY SIGNAL")
+                        send_telegram(msg)
+                        time.sleep(300) # Wait 5 mins before checking again
+
+                # --- SELL LOGIC ---
+                elif prediction == 2:
+                    sl, tp = calculate_smart_levels("SELL", current_price, df_full, atr)
+                    risk_pct = (sl - current_price) / current_price
+                    
+                    if risk_pct > MAX_SL_PERCENT:
+                        print(f"⚠️ Signal Ignored: Stop Loss too wide ({risk_pct*100:.2f}%)")
+                    elif sl <= current_price:
+                        print(f"⚠️ Signal Ignored: SL Calculation Error (Price close to high)")
+                    else:
+                        msg = (
+                            f"🔴 **SHORT ENTRY (SMC)**\n"
+                            f"Pair: `{SYMBOL}`\n"
+                            f"Price: `${current_price:.2f}`\n"
+                            f"---------------------\n"
+                            f"🛑 **SL: `${sl:.2f}`** (Above Structure)\n"
+                            f"🎯 **TP: `${tp:.2f}`** ({TARGET_RISK_REWARD}R)\n"
+                            f"---------------------\n"
+                            f"🤖 AI Conf: {confidence:.1f}%\n"
+                            f"Risk: {risk_pct*100:.2f}%"
+                        )
+                        print(">>> SENDING SELL SIGNAL")
+                        send_telegram(msg)
+                        time.sleep(300)
             
-            # Print Status
-            status = "HOLD"
-            if prediction == 1: status = "BUY"
-            if prediction == 2: status = "SELL"
-            print(f"Price: {price:.2f} | Signal: {status} | Conf: {confidence:.1f}%")
+            else:
+                # Idle print
+                print(f"⏳ {SYMBOL}: ${current_price:.2f} | AI: {probs.argmax()} ({confidence:.1f}%) | Waiting...")
 
-            # --- BUY SIGNAL ---
-            if prediction == 1 and confidence >= CONFIDENCE_THRESHOLD:
-                sl = price - (atr * ATR_SL_MULTIPLIER)
-                risk = price - sl
-                tp = price + (risk * RISK_REWARD)
-                
-                msg = (
-                    f"🚀 **BUY SIGNAL**\n"
-                    f"Pair: {SYMBOL}\n"
-                    f"Confidence: {confidence:.1f}%\n"
-                    f"----------------\n"
-                    f"ENTRY: ${price:.2f}\n"
-                    f"STOP LOSS: ${sl:.2f}\n"
-                    f"TAKE PROFIT: ${tp:.2f}\n"
-                    f"Risk: {RISK_REWARD}R"
-                )
-                print(">>> 🟢 SENDING BUY ALERT")
-                send_telegram(msg)
-                time.sleep(300) # Wait 5 mins
+        time.sleep(10) # Fast check
 
-            # --- SELL SIGNAL ---
-            elif prediction == 2 and confidence >= CONFIDENCE_THRESHOLD:
-                sl = price + (atr * ATR_SL_MULTIPLIER) # SL above for short
-                risk = sl - price
-                tp = price - (risk * RISK_REWARD)      # TP below for short
-                
-                msg = (
-                    f"🔻 **SELL SIGNAL**\n"
-                    f"Pair: {SYMBOL}\n"
-                    f"Confidence: {confidence:.1f}%\n"
-                    f"----------------\n"
-                    f"ENTRY: ${price:.2f}\n"
-                    f"STOP LOSS: ${sl:.2f}\n"
-                    f"TAKE PROFIT: ${tp:.2f}\n"
-                    f"Risk: {RISK_REWARD}R"
-                )
-                print(">>> 🔴 SENDING SELL ALERT")
-                send_telegram(msg)
-                time.sleep(300)
-
-        time.sleep(15) # Check every 15 seconds
-        
     except KeyboardInterrupt:
+        print("Stopping Bot...")
         break
     except Exception as e:
         print(f"Loop Error: {e}")
